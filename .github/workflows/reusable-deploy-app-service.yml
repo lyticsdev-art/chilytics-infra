@@ -44,7 +44,7 @@ on:
         description: Azure resource group
         required: false
         type: string
-        default: chilytics-${{ inputs.environment }}
+        default: chilytics-prod
       dockerfile-path:
         description: Path to Dockerfile relative to repo root
         required: false
