@@ -97,15 +97,14 @@ jobs:
             -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:latest \
             .
 
-      - name: Trivy security scan (advisory — surfaces HIGH/CRITICAL but does not block deploy)
-        # Day-0 deploys must not be blocked on transitive node_modules CVEs that
-        # need separate dep-bump PRs. Re-enable exit-code=1 once the vuln backlog
-        # is cleared. See SOP §22 (compliance pre-flight).
+      - name: Trivy security scan (fail on HIGH/CRITICAL)
+        # Backlog cleared (multer 2.x, fast-xml-builder override, uuid override,
+        # cross-spawn override). Re-tightened from advisory to blocking.
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }}
           severity: HIGH,CRITICAL
-          exit-code: '0'
+          exit-code: '1'
           ignore-unfixed: true
 
       - name: Push image
