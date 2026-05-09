@@ -90,6 +90,8 @@ jobs:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           action: upload
-          app_location: /
-          output_location: ${{ inputs.build-output-dir }}
-          skip_app_build: true     # we already built above with Vite
+          # IMPORTANT: app_location must point at the BUILT artifact, not the
+          # source root. With root, the action uploads node_modules/ + everything,
+          # blows past the SWA size limit. We already built with Vite above.
+          app_location: ${{ inputs.build-output-dir }}
+          skip_app_build: true
