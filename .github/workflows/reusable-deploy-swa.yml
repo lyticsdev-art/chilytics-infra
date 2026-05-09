@@ -1,0 +1,89 @@
+# Reusable workflow — build Vite app, deploy to Azure Static Web App.
+# Called by chilytics-frontend deploy.yml.
+#
+# Usage in caller:
+#   jobs:
+#     deploy:
+#       uses: lyticsdev-art/infra/.github/workflows/reusable-deploy-swa.yml@main
+#       with:
+#         app-name: chilytics-frontend-prod
+#         environment: prod
+#         backend-url: https://chilytics-backend-prod.azurewebsites.net
+#       secrets: inherit
+#
+# Required secrets:
+#   AZURE_CLIENT_ID         — federated app registration ID (OIDC)
+#   AZURE_TENANT_ID
+#   AZURE_SUBSCRIPTION_ID
+#   AZURE_STATIC_WEB_APPS_API_TOKEN_<ENV>   — SWA deploy token
+
+name: Reusable — Deploy Static Web App
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: SWA resource name
+        required: true
+        type: string
+      environment:
+        description: prod, staging, dev
+        required: true
+        type: string
+      backend-url:
+        description: chilytics-backend URL (baked into VITE_BACKEND_URL)
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: '20'
+      build-output-dir:
+        required: false
+        type: string
+        default: dist
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.app-name }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: false
+
+      - name: Build
+        env:
+          VITE_BACKEND_URL: ${{ inputs.backend-url }}
+        run: npm run build
+
+      - name: Deploy to SWA
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets[format('AZURE_STATIC_WEB_APPS_API_TOKEN_{0}', inputs.environment)] }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: /
+          output_location: ${{ inputs.build-output-dir }}
+          skip_app_build: true     # we already built above with Vite

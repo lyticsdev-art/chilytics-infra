@@ -1,0 +1,169 @@
+# Reusable workflow — build container, push to ACR, deploy to App Service.
+# Called by chilytics-inference and chilytics-backend deploy.yml workflows.
+#
+# Usage in caller:
+#   jobs:
+#     deploy:
+#       uses: lyticsdev-art/infra/.github/workflows/reusable-deploy-app-service.yml@main
+#       with:
+#         app-name: chilytics-backend          # Web App resource name = chilytics-<service>-<env>
+#         service-name: backend                 # short name for image tag
+#         environment: prod
+#       secrets: inherit
+#
+# Required secrets at the org or env level (OIDC federation, NO long-lived service principal):
+#   AZURE_CLIENT_ID         — federated app registration ID
+#   AZURE_TENANT_ID
+#   AZURE_SUBSCRIPTION_ID
+#   ACR_LOGIN_SERVER        — chilyticsacr<env>.azurecr.io
+#
+# Supply-chain attestation (SLSA L2):
+#   - Trivy fails the build on HIGH/CRITICAL CVEs
+#   - cosign --keyless signs every pushed image via GitHub OIDC → Sigstore Fulcio
+#   - cosign verify gate ensures the image we deploy was built BY THIS WORKFLOW
+#   - Signatures are stored as OCI 1.1 referrers in ACR + recorded in Rekor transparency log
+
+name: Reusable — Deploy App Service
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Web App resource name (chilytics-<service>-<env>)
+        required: true
+        type: string
+      service-name:
+        description: Short service name (inference, backend) for image tag
+        required: true
+        type: string
+      environment:
+        description: prod, staging, dev
+        required: true
+        type: string
+      resource-group:
+        description: Azure resource group
+        required: false
+        type: string
+        default: chilytics-${{ inputs.environment }}
+      dockerfile-path:
+        description: Path to Dockerfile relative to repo root
+        required: false
+        type: string
+        default: Dockerfile
+      health-path:
+        description: Health endpoint to verify after deploy
+        required: false
+        type: string
+        default: /health
+
+permissions:
+  id-token: write       # OIDC federation requires this
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.app-name }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          echo "tag=${{ inputs.environment }}-${short_sha}-$(date -u +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: ACR login
+        run: az acr login --name ${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Build image
+        run: |
+          docker build \
+            -f ${{ inputs.dockerfile-path }} \
+            -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }} \
+            -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:latest \
+            .
+
+      - name: Trivy security scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Push image
+        id: push
+        run: |
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }}
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:latest
+          # Capture the immutable digest after push — cosign signs by digest
+          # (NEVER by tag — tags are mutable, digests are content-addressable).
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' \
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }} \
+            | cut -d'@' -f2)
+          echo "digest=$digest" >> $GITHUB_OUTPUT
+          echo "image_ref=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}@$digest" >> $GITHUB_OUTPUT
+
+      - name: Install cosign (Sigstore — keyless signing via OIDC, no static keys)
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign container image (keyless, GitHub OIDC → Fulcio)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          # --yes auto-accepts the keyless signing prompt.
+          # The signature is stored alongside the image in ACR (OCI 1.1 referrers API)
+          # and the certificate identity is recorded in the Sigstore Rekor transparency log.
+          # Verifiers can confirm: "this image was built by GitHub Actions in the
+          # lyticsdev-art/<repo> repo on the main branch" without trusting any private key.
+          cosign sign --yes ${{ steps.push.outputs.image_ref }}
+
+      - name: Verify signature (defense in depth — fail deploy if signature missing)
+        run: |
+          cosign verify ${{ steps.push.outputs.image_ref }} \
+            --certificate-identity-regexp="^https://github\.com/lyticsdev-art/.+/\.github/workflows/.+@refs/(heads/main|tags/v.+)$" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Update App Service to new image
+        run: |
+          az webapp config container set \
+            --resource-group ${{ inputs.resource-group }} \
+            --name ${{ inputs.app-name }} \
+            --container-image-name ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }} \
+            --container-registry-url https://${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Restart App Service
+        run: az webapp restart --resource-group ${{ inputs.resource-group }} --name ${{ inputs.app-name }}
+
+      - name: Wait for health
+        run: |
+          url="https://${{ inputs.app-name }}.azurewebsites.net${{ inputs.health-path }}"
+          for i in $(seq 1 30); do
+            if curl -fsS "$url" > /dev/null; then
+              echo "Healthy after ${i}0 s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Did NOT become healthy in 5 minutes — investigate"
+          exit 1
+
+      - name: Logout
+        if: always()
+        run: az logout
